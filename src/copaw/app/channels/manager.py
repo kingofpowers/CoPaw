@@ -22,6 +22,7 @@ from typing import (
 
 from .base import BaseChannel, ContentType, ProcessHandler, TextContent
 from .registry import get_channel_registry
+from .router import AgentRouter, RouterConfig
 from ...config import get_available_channels
 
 if TYPE_CHECKING:
@@ -116,8 +117,13 @@ class ChannelManager:
     consume_one(). Enqueue via enqueue(channel_id, payload) (thread-safe).
     """
 
-    def __init__(self, channels: List[BaseChannel]):
+    def __init__(
+        self,
+        channels: List[BaseChannel],
+        router: Optional[AgentRouter] = None,
+    ):
         self.channels = channels
+        self.router = router
         self._lock = asyncio.Lock()
         self._queues: Dict[str, asyncio.Queue] = {}
         self._consumer_tasks: List[asyncio.Task[None]] = []
@@ -306,6 +312,9 @@ class ChannelManager:
         WebSocket or polling thread). If this session is already being
         processed, payload is held in pending and merged when the worker
         finishes. Call after start_all().
+
+        If a router is configured, the payload will be routed to the
+        appropriate agent pipeline based on routing rules.
         """
         if not self._queues.get(channel_id):
             logger.debug("enqueue: no queue for channel=%s", channel_id)
@@ -313,11 +322,55 @@ class ChannelManager:
         if self._loop is None:
             logger.warning("enqueue: loop not set for channel=%s", channel_id)
             return
+
+        # Route payload to target agent if router is configured
+        if self.router and self.router.config.enabled:
+            target_agent = self.router.route(payload)
+            if target_agent:
+                # Attach routing info to payload
+                payload = self._attach_routing_info(payload, target_agent)
+                logger.debug(
+                    "Routed payload: channel=%s, target_agent=%s",
+                    channel_id,
+                    target_agent,
+                )
+
         self._loop.call_soon_threadsafe(
             self._enqueue_one,
             channel_id,
             payload,
         )
+
+    def _attach_routing_info(self, payload: Any, target_agent: str) -> Any:
+        """Attach routing information to payload.
+
+        Args:
+            payload: Original payload
+            target_agent: Target agent_id from routing
+
+        Returns:
+            Payload with routing info attached
+        """
+        # If payload is a dict, add routing info directly
+        if isinstance(payload, dict):
+            payload = dict(payload)  # Make a copy
+            payload["_router_target_agent"] = target_agent
+            return payload
+
+        # If payload has attributes, try to set routing info
+        if hasattr(payload, "__dict__"):
+            try:
+                payload._router_target_agent = target_agent
+                return payload
+            except AttributeError:
+                pass
+
+        # Wrap in a routing envelope as last resort
+        return {
+            "_router_envelope": True,
+            "_router_target_agent": target_agent,
+            "_router_payload": payload,
+        }
 
     async def _consume_channel_loop(
         self,
