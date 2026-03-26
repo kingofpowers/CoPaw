@@ -260,17 +260,6 @@ class AgentRunner(Runner):
                 ),
             )
 
-            env_context = build_env_context(
-                session_id=session_id,
-                user_id=user_id,
-                channel=channel,
-                working_dir=(
-                    str(self.workspace_dir)
-                    if self.workspace_dir
-                    else str(WORKING_DIR)
-                ),
-            )
-
             # Get MCP clients from manager (hot-reloadable)
             mcp_clients = []
             if self._mcp_manager is not None:
@@ -279,18 +268,46 @@ class AgentRunner(Runner):
             # Load agent-specific configuration
             agent_config = load_agent_config(target_agent_id)
 
+            # Determine working directory for target agent
+            target_working_dir = agent_config.workspace_dir or (
+                str(self.workspace_dir) if self.workspace_dir else str(WORKING_DIR)
+            )
+
+            env_context = build_env_context(
+                session_id=session_id,
+                user_id=user_id,
+                channel=channel,
+                working_dir=target_working_dir,
+            )
+
+            # Create target agent session if routing to different agent
+            target_session = self.session
+            if target_agent_id != self.agent_id:
+                target_session_dir = str(
+                    Path(agent_config.workspace_dir or str(WORKING_DIR)) / "sessions"
+                )
+                target_session = SafeJSONSession(save_dir=target_session_dir)
+                logger.info(
+                    "Created target agent session: agent=%s, session_dir=%s",
+                    target_agent_id,
+                    target_session_dir,
+                )
+
             # Create memory_manager for target agent if routing to different agent
             memory_manager = self.memory_manager
             if target_agent_id != self.agent_id and self.memory_manager is not None:
                 from ...agents.memory import MemoryManager
 
+                # Use target agent's workspace_dir from its config
+                target_workspace_dir = agent_config.workspace_dir or str(WORKING_DIR)
                 memory_manager = MemoryManager(
-                    working_dir=str(WORKING_DIR),
+                    working_dir=target_workspace_dir,
                     agent_id=target_agent_id,
                 )
-                logger.debug(
-                    "Created new MemoryManager for target agent: %s",
+                logger.info(
+                    "Created new MemoryManager for target agent: %s, workspace_dir=%s",
                     target_agent_id,
+                    target_workspace_dir,
                 )
 
             agent = CoPawAgent(
@@ -314,7 +331,7 @@ class AgentRunner(Runner):
                         else {}
                     ),
                 },
-                workspace_dir=self.workspace_dir,
+                workspace_dir=Path(agent_config.workspace_dir) if agent_config.workspace_dir else self.workspace_dir,
             )
             await agent.register_mcp_clients()
             agent.set_console_output_enabled(enabled=False)
@@ -358,7 +375,7 @@ class AgentRunner(Runner):
                 )
 
             try:
-                await self.session.load_session_state(
+                await target_session.load_session_state(
                     session_id=session_id,
                     user_id=user_id,
                     agent=agent,
@@ -410,7 +427,7 @@ class AgentRunner(Runner):
             raise
         finally:
             if agent is not None and session_state_loaded:
-                await self.session.save_session_state(
+                await target_session.save_session_state(
                     session_id=session_id,
                     user_id=user_id,
                     agent=agent,

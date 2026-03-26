@@ -255,7 +255,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         Args:
             toolkit: Toolkit to register skills to
         """
-        workspace_dir = self._workspace_dir or WORKING_DIR
+        workspace_dir = Path(self._workspace_dir or WORKING_DIR)
 
         # Check skills initialization
         ensure_skills_initialized(workspace_dir)
@@ -298,7 +298,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             heartbeat_enabled = self._agent_config.heartbeat.enabled
 
         sys_prompt = build_system_prompt_from_working_dir(
-            working_dir=self._workspace_dir,
+            working_dir=Path(self._workspace_dir) if self._workspace_dir else None,
             agent_id=agent_id,
             heartbeat_enabled=heartbeat_enabled,
         )
@@ -354,7 +354,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         # Bootstrap hook - checks BOOTSTRAP.md on first interaction
         # Use workspace_dir if available, else fallback to WORKING_DIR
         working_dir = (
-            self._workspace_dir if self._workspace_dir else WORKING_DIR
+            Path(self._workspace_dir) if self._workspace_dir else WORKING_DIR
         )
         bootstrap_hook = BootstrapHook(
             working_dir=working_dir,
@@ -890,7 +890,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         # Set workspace_dir in context for tool functions
         from ..config.context import set_current_workspace_dir
 
-        set_current_workspace_dir(self._workspace_dir)
+        set_current_workspace_dir(Path(self._workspace_dir) if self._workspace_dir else None)
 
         # Process file and media blocks in messages
         if msg is not None:
