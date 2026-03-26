@@ -406,12 +406,30 @@ class BaseChannel(ABC):
         Convert queue payload to AgentRequest. Default: if payload looks like
         AgentRequest (has session_id, input), return it; else
         build_agent_request_from_native(payload). Override if needed.
+
+        Also handles routing info from ChannelManager router.
         """
         if payload is None:
             raise ValueError("payload is None")
+
+        # Extract routing info from payload envelope
+        router_target_agent = None
+        if isinstance(payload, dict) and payload.get("_router_envelope"):
+            router_target_agent = payload.get("_router_target_agent")
+            payload = payload.get("_router_payload")
+        elif isinstance(payload, dict) and "_router_target_agent" in payload:
+            router_target_agent = payload.pop("_router_target_agent")
+
         if hasattr(payload, "session_id") and hasattr(payload, "input"):
-            return payload
-        return self.build_agent_request_from_native(payload)
+            request = payload
+        else:
+            request = self.build_agent_request_from_native(payload)
+
+        # Attach routing info to request for AgentRunner
+        if router_target_agent and request is not None:
+            setattr(request, "_router_target_agent", router_target_agent)
+
+        return request
 
     def get_to_handle_from_request(self, request: "AgentRequest") -> str:
         """

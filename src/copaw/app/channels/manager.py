@@ -22,7 +22,10 @@ from typing import (
 
 from .base import BaseChannel, ContentType, ProcessHandler, TextContent
 from .registry import get_channel_registry
+from .router import AgentRouter, RouterConfig
 from ...config import get_available_channels
+from ...agents.command_handler import CommandHandler
+from ...app.runner.daemon_commands import DAEMON_SUBCOMMANDS, DAEMON_SHORT_ALIASES
 
 if TYPE_CHECKING:
     from ....config.config import Config
@@ -116,8 +119,13 @@ class ChannelManager:
     consume_one(). Enqueue via enqueue(channel_id, payload) (thread-safe).
     """
 
-    def __init__(self, channels: List[BaseChannel]):
+    def __init__(
+        self,
+        channels: List[BaseChannel],
+        router: Optional[AgentRouter] = None,
+    ):
         self.channels = channels
+        self.router = router
         self._lock = asyncio.Lock()
         self._queues: Dict[str, asyncio.Queue] = {}
         self._consumer_tasks: List[asyncio.Task[None]] = []
@@ -301,11 +309,158 @@ class ChannelManager:
             return
         q.put_nowait(payload)
 
+    def _extract_text_from_content_parts(self, parts: list) -> str | None:
+        """Extract text from content_parts list.
+
+        Args:
+            parts: List of content parts (dicts or objects with 'type' and content fields)
+
+        Returns:
+            Concatenated text content or None
+        """
+        if not parts:
+            return None
+
+        texts = []
+        for part in parts:
+            # Handle dict format
+            if isinstance(part, dict):
+                part_type = part.get("type", "")
+                if part_type == "text":
+                    text = part.get("text", "")
+                    if text:
+                        texts.append(text)
+                elif part_type in ("image", "file"):
+                    continue
+                else:
+                    text = part.get("content") or part.get("text", "")
+                    if text:
+                        texts.append(text)
+
+            # Handle object format (e.g., TextContent with attributes)
+            elif hasattr(part, "type"):
+                part_type = getattr(part, "type", "")
+                if part_type == "text":
+                    text = getattr(part, "text", None) or getattr(part, "content", None) or ""
+                    if text:
+                        texts.append(text)
+                elif part_type in ("image", "file"):
+                    continue
+                else:
+                    text = getattr(part, "text", None) or getattr(part, "content", None) or ""
+                    if text:
+                        texts.append(text)
+
+            # Handle plain string
+            elif isinstance(part, str):
+                texts.append(part)
+
+        return " ".join(texts) if texts else None
+
+    def _extract_text_from_payload(self, payload: Any) -> str | None:
+        """Extract text content from payload for command detection.
+
+        Args:
+            payload: Channel payload (dict or AgentRequest)
+
+        Returns:
+            Text content if found, None otherwise
+        """
+        if payload is None:
+            return None
+
+        # Handle dict payload (native format, e.g., OneBot)
+        if isinstance(payload, dict):
+            # Try content_parts first (OneBot format)
+            content_parts = payload.get("content_parts")
+            if isinstance(content_parts, list) and content_parts:
+                text = self._extract_text_from_content_parts(content_parts)
+                if text:
+                    return text
+
+            # Try content or text fields
+            content = payload.get("content") or payload.get("text", "")
+            if isinstance(content, str) and content:
+                return content
+            if isinstance(content, list):
+                text = self._extract_text_from_content_parts(content)
+                if text:
+                    return text
+            return None
+
+        # Handle AgentRequest-like objects
+        if hasattr(payload, "content"):
+            content = payload.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                text = self._extract_text_from_content_parts(content)
+                if text:
+                    return text
+
+        # Handle content_parts attribute directly
+        if hasattr(payload, "content_parts"):
+            parts = payload.content_parts
+            if isinstance(parts, list) and parts:
+                text = self._extract_text_from_content_parts(parts)
+                if text:
+                    return text
+
+        # Handle input attribute
+        if hasattr(payload, "input"):
+            inp = payload.input
+            if isinstance(inp, str):
+                return inp
+            if isinstance(inp, list) and inp:
+                last = inp[-1]
+                if hasattr(last, "get_text_content"):
+                    return last.get_text_content()
+                if isinstance(last, dict):
+                    return last.get("content") or last.get("text", "")
+
+        return None
+
+    def _is_slash_command(self, text: str | None) -> bool:
+        """Check if text is a slash command that should bypass queue.
+
+        Checks against:
+        - CommandHandler.SYSTEM_COMMANDS (conversation commands)
+        - DAEMON_SUBCOMMANDS (daemon commands)
+        - DAEMON_SHORT_ALIASES (daemon shortcuts)
+
+        Args:
+            text: Text content to check
+
+        Returns:
+            True if this is a slash command
+        """
+        if not text:
+            return False
+        text = text.strip()
+        if not text.startswith("/"):
+            return False
+        # Extract command name (first word after /)
+        cmd = text[1:].split()[0] if len(text) > 1 else ""
+
+        # Check against all known command sets
+        all_commands = (
+            CommandHandler.SYSTEM_COMMANDS
+            | DAEMON_SUBCOMMANDS
+            | set(DAEMON_SHORT_ALIASES.keys())
+        )
+
+        return cmd in all_commands
+
     def enqueue(self, channel_id: str, payload: Any) -> None:
         """Enqueue a payload for the channel. Thread-safe (e.g. from sync
         WebSocket or polling thread). If this session is already being
         processed, payload is held in pending and merged when the worker
         finishes. Call after start_all().
+
+        If a router is configured, the payload will be routed to the
+        appropriate agent pipeline based on routing rules.
+
+        Slash commands bypass the queue and are processed immediately.
         """
         if not self._queues.get(channel_id):
             logger.debug("enqueue: no queue for channel=%s", channel_id)
@@ -313,11 +468,132 @@ class ChannelManager:
         if self._loop is None:
             logger.warning("enqueue: loop not set for channel=%s", channel_id)
             return
+
+        # Check if this is a slash command that should bypass queue
+        text = self._extract_text_from_payload(payload)
+        if self._is_slash_command(text):
+            logger.info(
+                "Slash command bypassing queue: channel=%s, cmd=%s",
+                channel_id,
+                text.strip().split()[0] if text else "",
+            )
+            # Process directly without queuing
+            self._loop.call_soon_threadsafe(
+                self._process_slash_command,
+                channel_id,
+                payload,
+            )
+            return
+
+        # Route payload to target agent if router is configured
+        if self.router and self.router.config.enabled:
+            target_agent = self.router.route(payload)
+            if target_agent:
+                # Attach routing info to payload
+                payload = self._attach_routing_info(payload, target_agent)
+                logger.debug(
+                    "Routed payload: channel=%s, target_agent=%s",
+                    channel_id,
+                    target_agent,
+                )
+
         self._loop.call_soon_threadsafe(
             self._enqueue_one,
             channel_id,
             payload,
         )
+
+    def _attach_routing_info(self, payload: Any, target_agent: str) -> Any:
+        """Attach routing information to payload.
+
+        Args:
+            payload: Original payload
+            target_agent: Target agent_id from routing
+
+        Returns:
+            Payload with routing info attached
+        """
+        # If payload is a dict, add routing info directly
+        if isinstance(payload, dict):
+            payload = dict(payload)  # Make a copy
+            payload["_router_target_agent"] = target_agent
+            return payload
+
+        # If payload has attributes, try to set routing info
+        if hasattr(payload, "__dict__"):
+            try:
+                payload._router_target_agent = target_agent
+                return payload
+            except AttributeError:
+                pass
+
+        # Wrap in a routing envelope as last resort
+        return {
+            "_router_envelope": True,
+            "_router_target_agent": target_agent,
+            "_router_payload": payload,
+        }
+
+    def _process_slash_command(
+        self,
+        channel_id: str,
+        payload: Any,
+    ) -> None:
+        """Process a slash command directly without queuing.
+
+        This method is called from the event loop thread (via call_soon_threadsafe)
+        to process slash commands immediately, bypassing the normal queue mechanism.
+
+        Args:
+            channel_id: Channel identifier
+            payload: Command payload
+        """
+        # Create a task to process the command asynchronously
+        asyncio.create_task(
+            self._process_slash_command_async(channel_id, payload),
+        )
+
+    async def _process_slash_command_async(
+        self,
+        channel_id: str,
+        payload: Any,
+    ) -> None:
+        """Async implementation of slash command processing.
+
+        Args:
+            channel_id: Channel identifier
+            payload: Command payload
+        """
+        try:
+            ch = await self.get_channel(channel_id)
+            if not ch:
+                logger.warning(
+                    "Cannot process slash command: channel=%s not found",
+                    channel_id,
+                )
+                return
+
+            logger.debug(
+                "Processing slash command directly: channel=%s",
+                channel_id,
+            )
+
+            # Convert payload to AgentRequest
+            request = ch._payload_to_request(payload)
+
+            # Process the request directly (same as consume_one but without queue)
+            await ch._consume_one_request(request)
+
+            logger.debug(
+                "Slash command processed successfully: channel=%s",
+                channel_id,
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to process slash command: channel=%s",
+                channel_id,
+            )
 
     async def _consume_channel_loop(
         self,

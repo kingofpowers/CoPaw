@@ -222,15 +222,20 @@ class AgentRunner(Runner):
                 yield msg, last
             return
 
+        # Check for routing info from ChannelManager
+        router_target_agent = getattr(request, "_router_target_agent", None)
+        target_agent_id = router_target_agent or self.agent_id
+
         logger.debug(
-            f"AgentRunner.stream_query: request={request}, "
-            f"agent_id={self.agent_id}",
+            f"AgentRunner.query_handler: request={request}, "
+            f"runner_agent_id={self.agent_id}, "
+            f"target_agent_id={target_agent_id}",
         )
 
         # Set agent context for model creation
         from ..agent_context import set_current_agent_id
 
-        set_current_agent_id(self.agent_id)
+        set_current_agent_id(target_agent_id)
 
         agent = None
         chat = None
@@ -272,18 +277,32 @@ class AgentRunner(Runner):
                 mcp_clients = await self._mcp_manager.get_clients()
 
             # Load agent-specific configuration
-            agent_config = load_agent_config(self.agent_id)
+            agent_config = load_agent_config(target_agent_id)
+
+            # Create memory_manager for target agent if routing to different agent
+            memory_manager = self.memory_manager
+            if target_agent_id != self.agent_id and self.memory_manager is not None:
+                from ...agents.memory import MemoryManager
+
+                memory_manager = MemoryManager(
+                    working_dir=str(WORKING_DIR),
+                    agent_id=target_agent_id,
+                )
+                logger.debug(
+                    "Created new MemoryManager for target agent: %s",
+                    target_agent_id,
+                )
 
             agent = CoPawAgent(
                 agent_config=agent_config,
                 env_context=env_context,
                 mcp_clients=mcp_clients,
-                memory_manager=self.memory_manager,
+                memory_manager=memory_manager,
                 request_context={
                     "session_id": session_id,
                     "user_id": user_id,
                     "channel": channel,
-                    "agent_id": self.agent_id,
+                    "agent_id": target_agent_id,
                     **(
                         {
                             "forced_tool_call_json": json.dumps(
