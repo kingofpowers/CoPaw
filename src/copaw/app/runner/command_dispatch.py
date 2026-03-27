@@ -116,6 +116,7 @@ async def run_command_path(
             manager=manager,
             agent_id=agent_id,
             session_id=session_id,
+            channel_id=getattr(request, "channel", ""),
         )
         msg = await handler.handle_daemon_command(query, context)
         yield msg, True

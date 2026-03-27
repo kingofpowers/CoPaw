@@ -295,6 +295,12 @@ class AgentRunner(Runner):
 
             # Create memory_manager for target agent if routing to different agent
             memory_manager = self.memory_manager
+            logger.info(
+                "Routing check: runner_agent_id=%s, target_agent_id=%s, memory_manager=%s",
+                self.agent_id,
+                target_agent_id,
+                self.memory_manager is not None,
+            )
             if target_agent_id != self.agent_id and self.memory_manager is not None:
                 from ...agents.memory import MemoryManager
 
@@ -308,6 +314,12 @@ class AgentRunner(Runner):
                     "Created new MemoryManager for target agent: %s, workspace_dir=%s",
                     target_agent_id,
                     target_workspace_dir,
+                )
+            elif target_agent_id != self.agent_id:
+                logger.warning(
+                    "Routing to different agent but memory_manager is None, "
+                    "workspace_dir may be incorrect: target=%s",
+                    target_agent_id,
                 )
 
             agent = CoPawAgent(
@@ -403,7 +415,7 @@ class AgentRunner(Runner):
             logger.info(f"query_handler: {session_id} cancelled!")
             if agent is not None:
                 await agent.interrupt()
-            raise RuntimeError("Task has been cancelled!") from exc
+            raise  # Re-raise CancelledError to propagate cancellation
         except Exception as e:
             debug_dump_path = write_query_error_dump(
                 request=request,

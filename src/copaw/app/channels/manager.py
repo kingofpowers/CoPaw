@@ -67,31 +67,35 @@ def _drain_same_key(
 
 async def _process_batch(ch: BaseChannel, batch: List[Any]) -> None:
     """Merge if needed and process one payload (native or request)."""
-    if ch.channel == "dingtalk" and batch and ch._is_native_payload(batch[0]):
-        first = batch[0] if isinstance(batch[0], dict) else {}
-        logger.info(
-            "manager _process_batch dingtalk: batch_len=%s first_has_sw=%s",
-            len(batch),
-            bool(first.get("session_webhook")),
-        )
-    if len(batch) > 1 and ch._is_native_payload(batch[0]):
-        merged = ch.merge_native_items(batch)
-        if ch.channel == "dingtalk" and isinstance(merged, dict):
+    try:
+        if ch.channel == "dingtalk" and batch and ch._is_native_payload(batch[0]):
+            first = batch[0] if isinstance(batch[0], dict) else {}
             logger.info(
-                "manager _process_batch dingtalk merged: has_sw=%s",
-                bool(merged.get("session_webhook")),
+                "manager _process_batch dingtalk: batch_len=%s first_has_sw=%s",
+                len(batch),
+                bool(first.get("session_webhook")),
             )
-        await ch._consume_one_request(merged)
-    elif len(batch) > 1:
-        merged = ch.merge_requests(batch)
-        if merged is not None:
+        if len(batch) > 1 and ch._is_native_payload(batch[0]):
+            merged = ch.merge_native_items(batch)
+            if ch.channel == "dingtalk" and isinstance(merged, dict):
+                logger.info(
+                    "manager _process_batch dingtalk merged: has_sw=%s",
+                    bool(merged.get("session_webhook")),
+                )
             await ch._consume_one_request(merged)
+        elif len(batch) > 1:
+            merged = ch.merge_requests(batch)
+            if merged is not None:
+                await ch._consume_one_request(merged)
+            else:
+                await ch.consume_one(batch[0])
+        elif ch._is_native_payload(batch[0]):
+            await ch._consume_one_request(batch[0])
         else:
             await ch.consume_one(batch[0])
-    elif ch._is_native_payload(batch[0]):
-        await ch._consume_one_request(batch[0])
-    else:
-        await ch.consume_one(batch[0])
+    except asyncio.CancelledError:
+        logger.info(f"Process batch cancelled for channel={ch.channel}")
+        raise  # Re-raise to propagate cancellation
 
 
 def _put_pending_merged(
@@ -139,6 +143,8 @@ class ChannelManager:
         # [image1, text] are not split across workers (avoids no-text
         # debounce reordering and duplicate content in AgentRequest).
         self._key_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        # Session tasks: (channel_id, session_key) -> Task for cancellation
+        self._session_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
 
     @classmethod
     def from_env(
@@ -624,7 +630,16 @@ class ChannelManager:
                     async with key_lock:
                         self._in_progress.add((channel_id, key))
                         batch = _drain_same_key(q, ch, key, payload)
-                    await _process_batch(ch, batch)
+                    # Wrap processing in a Task for cancellation support
+                    process_task = asyncio.create_task(
+                        _process_batch(ch, batch),
+                        name=f"process_{channel_id}_{key}",
+                    )
+                    self._session_tasks[(channel_id, key)] = process_task
+                    try:
+                        await process_task
+                    finally:
+                        self._session_tasks.pop((channel_id, key), None)
                 finally:
                     self._in_progress.discard((channel_id, key))
                     pending = self._pending.pop((channel_id, key), [])
@@ -685,6 +700,7 @@ class ChannelManager:
                 )
         self._consumer_tasks.clear()
         self._queues.clear()
+        self._session_tasks.clear()
         async with self._lock:
             snapshot = list(self.channels)
         for ch in snapshot:
@@ -853,3 +869,74 @@ class ChannelManager:
             [TextContent(type=ContentType.TEXT, text=text)],
             merged_meta,
         )
+
+    def get_session_status(
+        self,
+        channel_id: str,
+        session_key: str,
+    ) -> dict:
+        """Get session processing status and pending count.
+
+        Args:
+            channel_id: Channel identifier
+            session_key: Session debounce key (usually "user_id:session_id")
+
+        Returns:
+            dict with:
+                - is_processing: bool, whether session is being processed
+                - pending_count: int, number of pending messages
+                - queue_size: int, total queue size for the channel
+        """
+        key = (channel_id, session_key)
+        is_processing = key in self._in_progress
+        pending_count = len(self._pending.get(key, []))
+        queue_size = 0
+        if channel_id in self._queues:
+            queue_size = self._queues[channel_id].qsize()
+
+        return {
+            "is_processing": is_processing,
+            "pending_count": pending_count,
+            "queue_size": queue_size,
+        }
+
+    async def skip_session(
+        self,
+        channel_id: str,
+        session_key: str,
+    ) -> dict:
+        """Skip/clear pending messages for a session and cancel running task.
+
+        Args:
+            channel_id: Channel identifier
+            session_key: Session debounce key
+
+        Returns:
+            dict with:
+                - cleared_count: int, number of pending messages cleared
+                - was_processing: bool, whether session was being processed
+                - cancelled: bool, whether running task was cancelled
+        """
+        key = (channel_id, session_key)
+        was_processing = key in self._in_progress
+
+        # Clear pending messages for this session
+        cleared = self._pending.pop(key, [])
+        cleared_count = len(cleared)
+
+        # Cancel running task if exists
+        cancelled = False
+        task = self._session_tasks.get(key)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            cancelled = True
+
+        return {
+            "cleared_count": cleared_count,
+            "was_processing": was_processing,
+            "cancelled": cancelled,
+        }

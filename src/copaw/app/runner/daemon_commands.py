@@ -31,7 +31,7 @@ class RestartInProgressError(Exception):
 
 DAEMON_PREFIX = "/daemon"
 DAEMON_SUBCOMMANDS = frozenset(
-    {"status", "restart", "reload-config", "version", "logs", "approve"},
+    {"status", "restart", "reload-config", "version", "logs", "approve", "skip"},
 )
 # Short names: /restart -> /daemon restart, etc.
 DAEMON_SHORT_ALIASES = {
@@ -42,6 +42,7 @@ DAEMON_SHORT_ALIASES = {
     "version": "version",
     "logs": "logs",
     "approve": "approve",
+    "skip": "skip",
 }
 
 
@@ -57,6 +58,8 @@ class DaemonContext:
     agent_id: Optional[str] = None
     # Session ID for approval commands.
     session_id: str = ""
+    # Channel ID for session status queries
+    channel_id: str = ""
 
 
 def _get_last_lines(
@@ -95,7 +98,7 @@ def _get_last_lines(
 
 
 def run_daemon_status(context: DaemonContext) -> str:
-    """Return status text (health, config, memory_manager)."""
+    """Return status text (health, config, memory_manager, session status)."""
     parts = ["**Daemon Status**", ""]
     try:
         cfg = context.load_config_fn()
@@ -120,7 +123,60 @@ def run_daemon_status(context: DaemonContext) -> str:
         parts.append("- Memory manager: running")
     else:
         parts.append("- Memory manager: not attached")
+
+    # Session status
+    if context.manager and context.channel_id and context.session_id:
+        try:
+            agent_id = context.agent_id or "default"
+            ws = context.manager.agents.get(agent_id)
+            cm = ws.channel_manager if ws else None
+            if cm:
+                key = (context.channel_id, context.session_id)
+                is_processing = key in cm._in_progress
+                pending_count = len(cm._pending.get(key, []))
+                parts.append("")
+                parts.append("**Session Status**")
+                parts.append(f"- Agent: {agent_id}")
+                parts.append(f"- Channel: {context.channel_id}")
+                session_display = context.session_id[:20] + "..." if len(context.session_id) > 20 else context.session_id
+                parts.append(f"- Session: {session_display}")
+                parts.append(f"- Processing: {'yes' if is_processing else 'no'}")
+                parts.append(f"- Pending messages: {pending_count}")
+        except Exception as e:
+            parts.append(f"- Session status: error ({e})")
+    else:
+        parts.append("")
+        parts.append("**Session Status**")
+        parts.append("- Not available")
+
     return "\n".join(parts)
+
+
+async def run_daemon_skip(context: DaemonContext) -> str:
+    """Skip current session: clear pending messages and cancel running task."""
+    if not context.manager or not context.channel_id or not context.session_id:
+        return "Cannot skip: missing context information"
+
+    try:
+        agent_id = context.agent_id or "default"
+        ws = context.manager.agents.get(agent_id)
+        cm = ws.channel_manager if ws else None
+
+        if not cm:
+            return f"Channel manager not found for agent: {agent_id}"
+
+        result = await cm.skip_session(context.channel_id, context.session_id)
+
+        parts = ["**Skip Result**", ""]
+        parts.append(f"- Agent: {agent_id}")
+        parts.append(f"- Session: {context.session_id[:20]}..." if len(context.session_id) > 20 else f"- Session: {context.session_id}")
+        parts.append(f"- Cleared pending: {result['cleared_count']} messages")
+        parts.append(f"- Was processing: {'yes' if result['was_processing'] else 'no'}")
+        parts.append(f"- Task cancelled: {'yes' if result['cancelled'] else 'no'}")
+
+        return "\n".join(parts)
+    except Exception as e:
+        return f"Skip failed: {e}"
 
 
 async def run_daemon_restart(context: DaemonContext) -> str:
@@ -292,6 +348,8 @@ class DaemonCommandHandlerMixin:
         elif sub == "approve":
             session_id = getattr(context, "session_id", "") or ""
             text = await run_daemon_approve(context, session_id=session_id)
+        elif sub == "skip":
+            text = await run_daemon_skip(context)
         else:
             text = "Unknown daemon subcommand."
         logger.info("handle_daemon_command %s completed", query)
